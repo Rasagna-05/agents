@@ -64,6 +64,9 @@ from .generation import (
     update_instructions,
 )
 from .speech_handle import SpeechHandle
+# ADD: extension-layer guard for interruptions
+from .interrupt_filter import InterruptFilter, Decision
+import logging
 
 if TYPE_CHECKING:
     from ..llm import mcp
@@ -100,6 +103,14 @@ class AgentActivity(RecognitionHooks):
 
         self._current_speech: SpeechHandle | None = None
         self._speech_q: list[tuple[int, float, SpeechHandle]] = []
+
+        # ADD — extension layer state
+        self._interrupt_filter = InterruptFilter()
+        self._interrupt_logger = logging.getLogger("interrupt_guard")
+
+        # The SpeechHandle currently playing (so we can stop it on a valid user interruption)
+        self._current_speech_handle: SpeechHandle | None = None
+
 
         # for false interruption handling
         self._paused_speech: SpeechHandle | None = None
@@ -287,6 +298,17 @@ class AgentActivity(RecognitionHooks):
         )
 
         return use_aligned_transcript is True
+
+    # ADD — tiny helpers inside AgentActivity
+    def _on_tts_start(self, handle: SpeechHandle) -> None:
+        self._current_speech_handle = handle
+        self._interrupt_filter.set_agent_speaking(True)
+
+    def _on_tts_end(self, handle: SpeechHandle) -> None:
+        if self._current_speech_handle is handle:
+            self._current_speech_handle = None
+        Fself._interrupt_filter.set_agent_speaking(False)
+
 
     async def update_instructions(self, instructions: str) -> None:
         self._agent._instructions = instructions
@@ -810,6 +832,13 @@ class AgentActivity(RecognitionHooks):
             if is_given(allow_interruptions)
             else self.allow_interruptions,
         )
+        # mark that the agent has started speaking
+        self._on_tts_start(handle)
+
+        # automatically flip speaking flag off when playback finishes
+        handle.add_done_callback(lambda h: self._on_tts_end(h))
+
+        
         self._session.emit(
             "speech_created",
             SpeechCreatedEvent(speech_handle=handle, user_initiated=True, source="generate_reply"),
@@ -1180,6 +1209,32 @@ class AgentActivity(RecognitionHooks):
             self._interrupt_by_audio_activity()
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
+        # Keep the filter's view of "agent speaking" in sync
+        if speaking is not None:
+            self._interrupt_filter.set_agent_speaking(bool(speaking))
+
+        alt = ev.alternatives[0]
+        text = alt.text or ""
+        conf = getattr(alt, "confidence", None)  # may be None
+
+        decision = self._interrupt_filter.decide(text, conf)
+
+        if decision == Decision.IGNORE:
+            # Filler during TTS (or ultra low-conf filler while quiet) → swallow
+            return
+
+        if decision == Decision.STOP:
+            # Valid user interruption while agent is speaking → stop immediately
+            if self._current_speech_handle:
+                try:
+                    self._current_speech_handle.interrupt(force=True)
+                except Exception:
+                    self._interrupt_logger.exception("Failed to interrupt SpeechHandle on interim")
+            # Optional: handle command intent (e.g., "stop", "wait") here if you have a handler
+            # self._handle_stop_or_wait_intent(text, conf)
+            return
+        # ---- END interruption guard ----
+
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
@@ -1205,6 +1260,28 @@ class AgentActivity(RecognitionHooks):
                 self._start_false_interruption_timer(timeout)
 
     def on_final_transcript(self, ev: stt.SpeechEvent) -> None:
+            # ---- BEGIN interruption guard for FINAL transcript ----
+        alt = ev.alternatives[0]
+        text = alt.text or ""
+        conf = getattr(alt, "confidence", None)  # may be None
+
+        decision = self._interrupt_filter.decide(text, conf)
+
+        if decision == Decision.IGNORE:
+            # Filler-only final (or ultra low-conf filler while quiet) → swallow
+            return
+
+        if decision == Decision.STOP:
+            # Valid user interruption on final → stop TTS immediately
+            if self._current_speech_handle:
+                try:
+                    self._current_speech_handle.interrupt(force=True)
+                except Exception:
+                    self._interrupt_logger.exception("Failed to interrupt SpeechHandle on final")
+            # Optional: handle 'stop/wait' intent here if you have an intent handler
+            # self._handle_stop_or_wait_intent(text, conf)
+            return
+        # ---- END interruption guard ----
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
