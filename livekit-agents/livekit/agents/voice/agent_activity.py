@@ -307,7 +307,7 @@ class AgentActivity(RecognitionHooks):
     def _on_tts_end(self, handle: SpeechHandle) -> None:
         if self._current_speech_handle is handle:
             self._current_speech_handle = None
-        Fself._interrupt_filter.set_agent_speaking(False)
+        self._interrupt_filter.set_agent_speaking(False)
 
 
     async def update_instructions(self, instructions: str) -> None:
